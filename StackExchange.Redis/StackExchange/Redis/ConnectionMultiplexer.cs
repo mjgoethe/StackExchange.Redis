@@ -708,6 +708,35 @@ namespace StackExchange.Redis
             return false;
         }
 
+        private static async Task<Task<T>> WaitFirstNonNullIgnoreErrorsAsync<T>(Task<T>[] tasks)
+        {
+            if (tasks == null) throw new ArgumentNullException("tasks");
+            if (tasks.Length == 0) return null;
+            var typeNullable = (Nullable.GetUnderlyingType(typeof(T)) != null);
+            var taskList = tasks.Cast<Task>().ToList();
+
+            try
+            {
+                while (taskList.Count() > 0)
+                {
+#if NET40
+                    var allTasksAwaitingAny = TaskEx.WhenAny(taskList).ObserveErrors();
+#else
+                    var allTasksAwaitingAny = Task.WhenAny(taskList).ObserveErrors();
+#endif
+                    var result = await allTasksAwaitingAny.ForAwait();
+                    taskList.Remove((Task<T>)result);
+                    if (((Task<T>)result).IsFaulted) continue;
+                    if ((!typeNullable) || ((Task<T>)result).Result != null)
+                        return (Task<T>)result;
+                }
+            }
+            catch
+            { }
+
+            return null;
+        }
+
 
         /// <summary>
         /// Raised when a hash-slot has been relocated
@@ -834,7 +863,7 @@ namespace StackExchange.Redis
             {
                 throw new ArgumentException("configuration");
             }
-            if (config.EndPoints.Count == 0) throw new ArgumentException("No endpoints specified", nameof(configuration));
+            if (config.EndPoints.Count == 0 && config.SentinelConnection == null) throw new ArgumentException("No endpoints specified", nameof(configuration));
             config.SetDefaultPorts();
             return new ConnectionMultiplexer(config);
         }
@@ -984,6 +1013,22 @@ namespace StackExchange.Redis
         internal static long LastGlobalHeartbeatSecondsAgo => unchecked(Environment.TickCount - VolatileWrapper.Read(ref lastGlobalHeartbeatTicks)) / 1000;
 
         internal CompletionManager UnprocessableCompletionManager => unprocessableCompletionManager;
+
+        internal EndPoint GetConfiguredMasterForService(int timeoutmillis = -1)
+        {
+            var sentinelMasters = serverSnapshot
+                .Where(s => s.ServerType == ServerType.Sentinel)
+                .Select(s => GetServer(s.EndPoint).SentinelGetMasterAddressByNameAsync(RawConfig.ServiceName))
+                .ToArray();
+
+            var firstCompleteRequest = WaitFirstNonNullIgnoreErrorsAsync(sentinelMasters);
+            if (!firstCompleteRequest.Wait(timeoutmillis))
+                throw new TimeoutException("Timeout resolving master for service");
+            if (firstCompleteRequest.Result.Result == null)
+                throw new Exception("Unable to determine master");
+
+            return firstCompleteRequest.Result.Result;
+        }
 
         /// <summary>
         /// Obtain a pub/sub subscriber connection to the specified server
@@ -1140,8 +1185,8 @@ namespace StackExchange.Redis
             if (timeout >= int.MaxValue / retryCount) return int.MaxValue;
 
             timeout *= retryCount;
-            if (timeout >= int.MaxValue - 500) return int.MaxValue;
-            return timeout + Math.Min(500, timeout);
+            if (timeout >= int.MaxValue - 1000) return int.MaxValue;
+            return timeout + Math.Min(1000, timeout);
         }
         /// <summary>
         /// Provides a text overview of the status of all connections
@@ -1193,6 +1238,33 @@ namespace StackExchange.Redis
                 }
                 Trace("Starting reconfiguration...");
                 Trace(blame != null, "Blaming: " + Format.ToString(blame));
+
+                if (configuration.SentinelConnection != null)
+                {
+                    var subscriber = configuration.SentinelConnection.GetSubscriber();
+                    if (subscriber.SubscribedEndpoint("+switch-master") == null)
+                    {
+                        subscriber.Subscribe("+switch-master", (channel, message) =>
+                        {
+                            var messageParts = ((string)message).Split(new[] { ' ' }, StringSplitOptions.RemoveEmptyEntries);
+                            var switchBlame = Format.TryParseEndPoint(string.Format("{0}:{1}", messageParts[1], messageParts[2]));
+                            ReconfigureAsync(false, false, log, switchBlame, "master switch", false, CommandFlags.PreferMaster).Wait();
+                        });
+                    }
+
+                    EndPoint masterEndPoint = null;
+                    while (masterEndPoint == null)
+                    {
+                        masterEndPoint = configuration.SentinelConnection.GetConfiguredMasterForService();
+                    }
+                    if (!servers.Contains(masterEndPoint))
+                    {
+                        configuration.EndPoints.Clear();
+                        servers.Clear();
+                        configuration.EndPoints.Add(masterEndPoint);
+                        Trace(string.Format("Switching master to {0}", masterEndPoint));
+                    }
+                }
 
                 LogLocked(log, Configuration);
                 LogLocked(log, "");
